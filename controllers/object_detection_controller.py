@@ -53,6 +53,41 @@ class ImageDetectionResponse(BaseModel):
         }
     }
 
+class VideoDetectionResponse(BaseModel):
+    """
+    Réponse de l'API de détection d'objets dans une vidéo.
+    
+    Attributes:
+        task_id: Identifiant unique de la tâche de traitement
+        filename: Nom du fichier original
+        content_type: Type MIME du fichier
+        saved_at: Chemin où le fichier original est sauvegardé
+        status: État du traitement (en attente, en cours, terminé, erreur)
+        result_video: Chemin vers la vidéo avec les annotations (disponible une fois terminé)
+    """
+    task_id: str = Field(description="Identifiant unique de la tâche")
+    filename: str = Field(description="Nom du fichier original")
+    content_type: str = Field(description="Type MIME du fichier")
+    saved_at: str = Field(description="Chemin où le fichier original est sauvegardé")
+    status: str = Field(description="État du traitement")
+    result_video: Optional[str] = Field(None, description="Chemin vers la vidéo avec les annotations")
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "task_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+                "filename": "example.mp4",
+                "content_type": "video/mp4",
+                "saved_at": "uploads/example.mp4",
+                "status": "processing",
+                "result_video": None
+            }
+        }
+    }
+
+# Dictionnaire pour stocker l'état des tâches
+video_tasks = {}
+
 router = APIRouter(tags=["object-detection"])
 
 # Créer les dossiers nécessaires
@@ -132,3 +167,164 @@ async def detect_image(file: UploadFile = File(...)):
         "detections": detections,
         "detection_count": len(detections)
     }
+
+def process_video(task_id: str, video_path: str):
+    """
+    Traite une vidéo avec YOLO pour détecter les objets.
+    Cette fonction s'exécute en arrière-plan.
+    
+    Args:
+        task_id: Identifiant de la tâche
+        video_path: Chemin vers la vidéo à traiter
+    """
+    try:
+        # Mettre à jour le statut
+        video_tasks[task_id]["status"] = "processing"
+        
+        # Préparer le chemin de sortie
+        filename = os.path.basename(video_path)
+        output_path = os.path.join("results", f"result_{filename}")
+        
+        # Ouvrir la vidéo source
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise Exception("Impossible d'ouvrir la vidéo")
+        
+        # Obtenir les propriétés de la vidéo
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Créer l'objet VideoWriter pour la sortie
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        # Traiter chaque image
+        frame_count = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Détecter les objets avec YOLO
+            results = model(frame)
+            
+            # Dessiner les résultats sur l'image
+            annotated_frame = results[0].plot()
+            
+            # Écrire l'image dans la vidéo de sortie
+            out.write(annotated_frame)
+            
+            # Mettre à jour le compteur
+            frame_count += 1
+            
+            # Mettre à jour le statut avec la progression
+            progress = int((frame_count / total_frames) * 100)
+            video_tasks[task_id]["progress"] = progress
+        
+        # Libérer les ressources
+        cap.release()
+        out.release()
+        
+        # Mettre à jour le statut final
+        video_tasks[task_id]["status"] = "completed"
+        video_tasks[task_id]["result_video"] = output_path
+        
+    except Exception as e:
+        # En cas d'erreur, mettre à jour le statut
+        video_tasks[task_id]["status"] = "error"
+        video_tasks[task_id]["error"] = str(e)
+
+@router.post(
+    "/detect-video/", 
+    response_model=VideoDetectionResponse,
+    summary="Détecter des objets dans une vidéo",
+    description="""
+    Téléchargez une vidéo et détectez les objets présents en utilisant YOLOv8.
+    
+    Le traitement se fait en arrière-plan et peut prendre du temps selon la longueur de la vidéo.
+    Utilisez l'endpoint GET /video-status/{task_id} pour vérifier l'état du traitement.
+    
+    L'API retourne immédiatement:
+    - Un identifiant de tâche unique
+    - Les informations sur le fichier téléchargé
+    - Le statut initial du traitement
+    """
+)
+async def detect_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """
+    Détecte les objets dans une vidéo téléchargée en utilisant YOLOv8.
+    Le traitement se fait en arrière-plan.
+    
+    Args:
+        background_tasks: Gestionnaire de tâches en arrière-plan
+        file: Le fichier vidéo à analyser
+        
+    Returns:
+        Un objet VideoDetectionResponse contenant l'ID de la tâche et le statut initial
+        
+    Raises:
+        HTTPException: Si le fichier n'est pas une vidéo
+    """
+    # Vérifier que le fichier est une vidéo
+    if not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Le fichier doit être une vidéo")
+    
+    # Générer un ID unique pour cette tâche
+    task_id = str(uuid.uuid4())
+    
+    # Chemin où le fichier sera sauvegardé
+    file_path = os.path.join("uploads", file.filename)
+    
+    # Sauvegarder le fichier
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    # Créer une entrée pour cette tâche
+    video_tasks[task_id] = {
+        "task_id": task_id,
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "saved_at": file_path,
+        "status": "pending",
+        "created_at": datetime.now().isoformat(),
+        "progress": 0,
+        "result_video": None
+    }
+    
+    # Lancer le traitement en arrière-plan
+    background_tasks.add_task(process_video, task_id, file_path)
+    
+    # Retourner immédiatement la réponse avec l'ID de la tâche
+    return {
+        "task_id": task_id,
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "saved_at": file_path,
+        "status": "pending",
+        "result_video": None
+    }
+
+@router.get(
+    "/video-status/{task_id}",
+    summary="Vérifier l'état d'une tâche de détection vidéo",
+    description="Récupère l'état actuel d'une tâche de détection d'objets dans une vidéo."
+)
+async def get_video_status(task_id: str):
+    """
+    Récupère l'état actuel d'une tâche de traitement vidéo.
+    
+    Args:
+        task_id: L'identifiant unique de la tâche
+        
+    Returns:
+        Les informations sur la tâche, y compris son état actuel
+        
+    Raises:
+        HTTPException: Si la tâche n'existe pas
+    """
+    if task_id not in video_tasks:
+        raise HTTPException(status_code=404, detail="Tâche non trouvée")
+    
+    return video_tasks[task_id]
