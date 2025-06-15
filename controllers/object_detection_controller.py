@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from typing import List, Dict, Any, Union, Optional
 from pydantic import BaseModel, Field
 import os
@@ -8,6 +8,9 @@ import cv2
 import numpy as np
 import uuid
 from datetime import datetime
+import base64
+import json
+import asyncio
 
 # Modèles de données pour la documentation
 class ImageDetectionResponse(BaseModel):
@@ -85,6 +88,38 @@ class VideoDetectionResponse(BaseModel):
         }
     }
 
+class RealTimeDetectionResponse(BaseModel):
+    """
+    Réponse pour la détection en temps réel.
+    
+    Attributes:
+        frame_id: Identifiant de l'image
+        detections: Liste des objets détectés
+        detection_count: Nombre d'objets détectés
+        annotated_frame: Image annotée encodée en base64
+    """
+    frame_id: int = Field(description="Identifiant de l'image")
+    detections: List[Dict[str, Any]] = Field(description="Liste des objets détectés")
+    detection_count: int = Field(description="Nombre d'objets détectés")
+    annotated_frame: str = Field(description="Image annotée encodée en base64")
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "frame_id": 42,
+                "detections": [
+                    {
+                        "class": "person",
+                        "confidence": 0.95,
+                        "bbox": [10.5, 20.3, 200.1, 300.7]
+                    }
+                ],
+                "detection_count": 1,
+                "annotated_frame": "base64_encoded_image_data..."
+            }
+        }
+    }
+
 # Dictionnaire pour stocker l'état des tâches
 video_tasks = {}
 
@@ -95,7 +130,7 @@ os.makedirs("uploads", exist_ok=True)
 os.makedirs("results", exist_ok=True)
 
 # Charger le modèle YOLO
-model = YOLO("model-detection.pt")  # Utilise le modèle YOLOv8 nano préentraîné
+model = YOLO("yolov8n.pt")  # Utilise le modèle YOLOv8 nano préentraîné
 
 @router.post(
     "/detect-image/", 
@@ -328,3 +363,85 @@ async def get_video_status(task_id: str):
         raise HTTPException(status_code=404, detail="Tâche non trouvée")
     
     return video_tasks[task_id]
+
+@router.websocket("/ws/detect-realtime/")
+async def detect_realtime(websocket: WebSocket):
+    """
+    Établit une connexion WebSocket pour la détection d'objets en temps réel.
+    
+    Le client envoie des images encodées en base64, et le serveur répond avec
+    les détections et l'image annotée.
+    """
+    await websocket.accept()
+    
+    try:
+        frame_id = 0
+        while True:
+            # Recevoir l'image du client
+            data = await websocket.receive_text()
+            
+            try:
+                # Décoder les données JSON
+                json_data = json.loads(data)
+                
+                # Extraire l'image encodée en base64
+                if "image" not in json_data:
+                    await websocket.send_json({"error": "Aucune image trouvée dans les données"})
+                    continue
+                
+                # Décoder l'image base64
+                image_data = base64.b64decode(json_data["image"])
+                nparr = np.frombuffer(image_data, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if frame is None:
+                    await websocket.send_json({"error": "Impossible de décoder l'image"})
+                    continue
+                
+                # Exécuter la détection avec YOLO
+                results = model(frame)
+                
+                # Extraire les résultats
+                detections = []
+                for result in results:
+                    boxes = result.boxes
+                    for box in boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        confidence = box.conf[0].item()
+                        class_id = int(box.cls[0].item())
+                        class_name = result.names[class_id]
+                        
+                        detections.append({
+                            "class": class_name,
+                            "confidence": round(confidence, 3),
+                            "bbox": [round(x, 2) for x in [x1, y1, x2, y2]]
+                        })
+                
+                # Dessiner les résultats sur l'image
+                annotated_frame = results[0].plot()
+                
+                # Encoder l'image annotée en base64
+                _, buffer = cv2.imencode('.jpg', annotated_frame)
+                annotated_frame_b64 = base64.b64encode(buffer).decode('utf-8')
+                
+                # Préparer la réponse
+                response = {
+                    "frame_id": frame_id,
+                    "detections": detections,
+                    "detection_count": len(detections),
+                    "annotated_frame": annotated_frame_b64
+                }
+                
+                # Envoyer la réponse au client
+                await websocket.send_json(response)
+                
+                # Incrémenter l'ID de l'image
+                frame_id += 1
+                
+            except json.JSONDecodeError:
+                await websocket.send_json({"error": "Format JSON invalide"})
+            except Exception as e:
+                await websocket.send_json({"error": str(e)})
+                
+    except WebSocketDisconnect:
+        print("Client déconnecté")

@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Détection d'objets en temps réel</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .video-container {
+            display: flex;
+            justify-content: space-between;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        .video-feed {
+            width: 48%;
+            position: relative;
+        }
+        video, canvas {
+            width: 100%;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        h2 {
+            text-align: center;
+            margin-bottom: 5px;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 0 10px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .detection-info {
+            width: 100%;
+            padding: 10px;
+            background-color: #f5f5f5;
+            border-radius: 5px;
+            margin-top: 20px;
+        }
+        .status {
+            color: #666;
+            margin-bottom: 10px;
+        }
+        .error {
+            color: red;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Détection d'objets en temps réel</h1>
+        
+        <div class="video-container">
+            <div class="video-feed">
+                <h2>Caméra</h2>
+                <video id="video" autoplay playsinline></video>
+            </div>
+            <div class="video-feed">
+                <h2>Détection</h2>
+                <img id="detection-result" src="" alt="Résultat de la détection">
+            </div>
+        </div>
+        
+        <div class="controls">
+            <button id="start-btn">Démarrer la caméra</button>
+            <button id="detect-btn" disabled>Démarrer la détection</button>
+            <button id="stop-btn" disabled>Arrêter</button>
+        </div>
+        
+        <div class="status" id="status">En attente de démarrage...</div>
+        
+        <div class="detection-info">
+            <h3>Objets détectés: <span id="detection-count">0</span></h3>
+            <pre id="detection-details"></pre>
+        </div>
+    </div>
+
+    <script>
+        // Éléments DOM
+        const video = document.getElementById('video');
+        const detectionResult = document.getElementById('detection-result');
+        const startBtn = document.getElementById('start-btn');
+        const detectBtn = document.getElementById('detect-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const statusElement = document.getElementById('status');
+        const detectionCount = document.getElementById('detection-count');
+        const detectionDetails = document.getElementById('detection-details');
+        
+        // Variables globales
+        let stream = null;
+        let websocket = null;
+        let isDetecting = false;
+        let canvas = document.createElement('canvas');
+        let ctx = canvas.getContext('2d');
+        
+        // Démarrer la caméra
+        startBtn.addEventListener('click', async () => {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: 'environment' // Utiliser la caméra arrière sur mobile
+                    } 
+                });
+                video.srcObject = stream;
+                
+                // Attendre que la vidéo soit chargée
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    
+                    startBtn.disabled = true;
+                    detectBtn.disabled = false;
+                    statusElement.textContent = 'Caméra prête. Cliquez sur "Démarrer la détection".';
+                };
+            } catch (err) {
+                showError(`Erreur d'accès à la caméra: ${err.message}`);
+            }
+        });
+        
+        // Démarrer la détection
+        detectBtn.addEventListener('click', () => {
+            if (!stream) {
+                showError('La caméra n\'est pas démarrée.');
+                return;
+            }
+            
+            // Créer la connexion WebSocket
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/detect-realtime/`;
+            
+            websocket = new WebSocket(wsUrl);
+            
+            websocket.onopen = () => {
+                isDetecting = true;
+                detectBtn.disabled = true;
+                stopBtn.disabled = false;
+                statusElement.textContent = 'Détection en cours...';
+                
+                // Démarrer l'envoi des images
+                sendVideoFrames();
+            };
+            
+            websocket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                
+                if (data.error) {
+                    showError(`Erreur: ${data.error}`);
+                    return;
+                }
+                
+                // Afficher l'image annotée
+                detectionResult.src = `data:image/jpeg;base64,${data.annotated_frame}`;
+                
+                // Mettre à jour les informations de détection
+                detectionCount.textContent = data.detection_count;
+                detectionDetails.textContent = JSON.stringify(data.detections, null, 2);
+            };
+            
+            websocket.onerror = (error) => {
+                showError(`Erreur WebSocket: ${error}`);
+                stopDetection();
+            };
+            
+            websocket.onclose = () => {
+                if (isDetecting) {
+                    statusElement.textContent = 'Connexion fermée. La détection est arrêtée.';
+                    stopDetection();
+                }
+            };
+        });
+        
+        // Arrêter la détection
+        stopBtn.addEventListener('click', () => {
+            stopDetection();
+        });
+        
+        // Envoyer les images de la caméra au serveur
+        function sendVideoFrames() {
+            if (!isDetecting || !websocket || websocket.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            
+            // Dessiner l'image actuelle sur le canvas
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // Convertir en base64
+            const imageData = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+            
+            // Envoyer au serveur
+            websocket.send(JSON.stringify({ image: imageData }));
+            
+            // Planifier le prochain envoi (environ 10 FPS)
+            setTimeout(sendVideoFrames, 100);
+        }
+        
+        // Arrêter la détection
+        function stopDetection() {
+            isDetecting = false;
+            
+            if (websocket) {
+                websocket.close();
+                websocket = null;
+            }
+            
+            detectBtn.disabled = !stream;
+            stopBtn.disabled = true;
+            statusElement.textContent = 'Détection arrêtée.';
+        }
+        
+        // Afficher une erreur
+        function showError(message) {
+            statusElement.innerHTML = `<span class="error">${message}</span>`;
+            console.error(message);
+        }
+        
+        // Nettoyage lors de la fermeture de la page
+        window.addEventListener('beforeunload', () => {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+            if (websocket) {
+                websocket.close();
+            }
+        });
+    </script>
+</body>
+</html>
