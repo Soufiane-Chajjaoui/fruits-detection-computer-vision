@@ -1,8 +1,7 @@
-# 🚀 Projet de Détection d'Objets avec YOLOv8
+# Projet de Détection d'Objets avec YOLOv8
 
-![YOLOv8 Detection Example](assets/demo.gif) *(Optionnel: Ajoutez une capture d'écran ou GIF)*
 
-## 📝 Description
+## Description
 Ce projet utilise **YOLOv8** pour détecter des objets en temps réel à partir :
 - D'une webcam
 - D'une vidéo
@@ -10,7 +9,7 @@ Ce projet utilise **YOLOv8** pour détecter des objets en temps réel à partir 
 
 **Cas d'utilisation** : Surveillance, analyse sportive, robotique, etc.
 
-## 📦 Installation
+## Installation
 
 ### 1. Cloner le dépôt
 ```bash
